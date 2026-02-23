@@ -57,6 +57,7 @@ Future<dynamic> main(final context) async {
 
     final database = appwrite.TablesDB(client);
     final messaging = appwrite.Messaging(client);
+    final storage = appwrite.Storage(client);
 
     final String databaseId = Platform.environment['APPWRITE_DATABASE_ID']!;
     final String broadcastCollectionId =
@@ -84,6 +85,7 @@ Future<dynamic> main(final context) async {
         return await _handleCreate(
           context,
           database,
+          storage,
           messaging,
           databaseId,
           broadcastCollectionId,
@@ -233,9 +235,18 @@ Future<List<String>> _resolveTargetAccountIds(
 // ═════════════════════════════════════════════════════════════════════════════
 // CREATE
 // ═════════════════════════════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTE: For video attachment, set these additional env vars in the Appwrite
+// Function settings:
+//   APPWRITE_MEDIA_FILES_COLLECTION_ID  (e.g. 687d1a25003639ab01fa)
+//   APPWRITE_FILE_ACCESS_COLLECTION_ID  (e.g. 687d1adf002fda9ac61f)
+//   APPWRITE_MEDIA_FILES_BUCKET_ID      (e.g. 687d19be0028cbdd997d)
+// Without them, broadcasts still work – just without file-manager integration.
+// ─────────────────────────────────────────────────────────────────────────────
 Future<dynamic> _handleCreate(
   dynamic context,
   appwrite.TablesDB database,
+  appwrite.Storage storage,
   appwrite.Messaging messaging,
   String databaseId,
   String broadcastCollectionId,
@@ -246,6 +257,15 @@ Future<dynamic> _handleCreate(
   final priority =
       (body['priority'] as String?)?.trim().toLowerCase() ?? 'normal';
   final videoUrl = (body['videoUrl'] as String?)?.trim();
+  final storageFileId = (body['storageFileId'] as String?)?.trim();
+  final adminUserId = (body['adminUserId'] as String?)?.trim() ?? '';
+  final videoMimeType =
+      (body['videoMimeType'] as String?)?.trim() ?? 'video/mp4';
+  final videoFileName =
+      (body['videoFileName'] as String?)?.trim() ?? 'broadcast_video.mp4';
+  final videoFileSizeBytes = body['videoFileSizeBytes'] is int
+      ? body['videoFileSizeBytes'] as int
+      : int.tryParse(body['videoFileSizeBytes']?.toString() ?? '') ?? 0;
   final isActive = body['isActive'] as bool? ?? true;
 
   if (text.isEmpty) {
@@ -295,7 +315,10 @@ Future<dynamic> _handleCreate(
     'is_active': isActive,
   };
 
-  if (videoUrl != null && videoUrl.isNotEmpty) {
+  // Prefer uploaded storage file over legacy URL
+  if (storageFileId != null && storageFileId.isNotEmpty) {
+    docData['storage_file_id'] = storageFileId;
+  } else if (videoUrl != null && videoUrl.isNotEmpty) {
     docData['video_url'] = videoUrl;
   }
 
@@ -346,6 +369,50 @@ Future<dynamic> _handleCreate(
     }
   }
 
+  // 5. Attach video file to the file manager for all recipients (Option B –
+  //    no owner entry; video appears in each recipient's "Shared with me" list)
+  int fileAccessCount = 0;
+  String fileAttachError = '';
+  if (storageFileId != null && storageFileId.isNotEmpty) {
+    final mediaFilesCollectionId =
+        Platform.environment['APPWRITE_MEDIA_FILES_COLLECTION_ID'] ?? '';
+    final fileAccessCollectionId =
+        Platform.environment['APPWRITE_FILE_ACCESS_COLLECTION_ID'] ?? '';
+    final mediaFilesBucketId =
+        Platform.environment['APPWRITE_MEDIA_FILES_BUCKET_ID'] ?? '';
+
+    if (mediaFilesCollectionId.isNotEmpty &&
+        fileAccessCollectionId.isNotEmpty &&
+        mediaFilesBucketId.isNotEmpty) {
+      try {
+        fileAccessCount = await _attachVideoFile(
+          context: context,
+          database: database,
+          storage: storage,
+          databaseId: databaseId,
+          storageFileId: storageFileId,
+          broadcastDocId: doc.$id,
+          targetAccountIds: targetAccountIds,
+          adminUserId: adminUserId,
+          mimeType: videoMimeType,
+          fileName: videoFileName,
+          fileSizeBytes: videoFileSizeBytes,
+          mediaFilesCollectionId: mediaFilesCollectionId,
+          fileAccessCollectionId: fileAccessCollectionId,
+          mediaFilesBucketId: mediaFilesBucketId,
+        );
+      } catch (e) {
+        fileAttachError = e.toString();
+        context.log('Warning: video attachment failed: $e');
+        // Broadcast was still created — don't fail the whole request
+      }
+    } else {
+      fileAttachError =
+          'Media-file env vars not configured — video broadcast created but not shared to file manager';
+      context.log('Warning: $fileAttachError');
+    }
+  }
+
   return context.res.json({
     'ok': true,
     'result': 'Broadcast created',
@@ -358,7 +425,119 @@ Future<dynamic> _handleCreate(
     'targetCount': targetAccountIds.length,
     'pushSent': pushSent,
     'pushError': pushError,
+    'fileAccessCount': fileAccessCount,
+    if (fileAttachError.isNotEmpty) 'fileAttachError': fileAttachError,
   });
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// ATTACH VIDEO FILE
+// ═════════════════════════════════════════════════════════════════════════════
+/// Sets Storage + DB permissions for a newly uploaded broadcast video file,
+/// creates a mediaFiles record, and creates file_access 'read' entries for
+/// every recipient.  No 'owner' entry → appears in "Shared with me".
+Future<int> _attachVideoFile({
+  required dynamic context,
+  required appwrite.TablesDB database,
+  required appwrite.Storage storage,
+  required String databaseId,
+  required String storageFileId,
+  required String broadcastDocId,
+  required List<String> targetAccountIds,
+  required String adminUserId,
+  required String mimeType,
+  required String fileName,
+  required int fileSizeBytes,
+  required String mediaFilesCollectionId,
+  required String fileAccessCollectionId,
+  required String mediaFilesBucketId,
+}) async {
+  final now = DateTime.now().toIso8601String();
+
+  // 1. Fetch current storage file permissions and add recipients
+  final storageFile = await storage.getFile(
+    bucketId: mediaFilesBucketId,
+    fileId: storageFileId,
+  );
+  final storagePerms = List<String>.from(storageFile.$permissions);
+  for (final id in targetAccountIds) {
+    final p = 'read("user:$id")';
+    if (!storagePerms.contains(p)) storagePerms.add(p);
+  }
+  for (final p in [
+    'read("team:admin")',
+    'update("team:admin")',
+    'delete("team:admin")',
+  ]) {
+    if (!storagePerms.contains(p)) storagePerms.add(p);
+  }
+  await storage.updateFile(
+    bucketId: mediaFilesBucketId,
+    fileId: storageFileId,
+    permissions: storagePerms,
+  );
+  context.log('Storage permissions set for ${targetAccountIds.length} users');
+
+  // 2. Create mediaFiles DB document (read-only for all recipients, no owner)
+  final dbPerms = <String>[
+    for (final id in targetAccountIds) 'read("user:$id")',
+    'read("team:admin")',
+    'update("team:admin")',
+    'delete("team:admin")',
+  ];
+  final mediaFileDoc = await database.createRow(
+    databaseId: databaseId,
+    tableId: mediaFilesCollectionId,
+    rowId: appwrite.ID.unique(),
+    data: {
+      'fileName': fileName,
+      'originalName': fileName,
+      'fileType': 'video',
+      'mimeType': mimeType,
+      'fileSizeBytes': fileSizeBytes,
+      'uploadedBy': adminUserId.isNotEmpty ? adminUserId : 'broadcast-system',
+      'uploadedAt': now,
+      'description': 'Broadcast-Video (Broadcast: $broadcastDocId)',
+      'durationSeconds': 0,
+      'storageFileId': storageFileId,
+      'folder': 'Broadcasts',
+    },
+    permissions: dbPerms,
+  );
+  final mediaFileDocId = mediaFileDoc.$id;
+  context.log('MediaFiles record created: $mediaFileDocId');
+
+  // 3. Create file_access 'read' entry per recipient (no 'owner' – Option B)
+  int created = 0;
+  for (final accountId in targetAccountIds) {
+    try {
+      await database.createRow(
+        databaseId: databaseId,
+        tableId: fileAccessCollectionId,
+        rowId: appwrite.ID.unique(),
+        data: {
+          'fileId': mediaFileDocId,
+          'userId': accountId,
+          'accessType': 'read',
+          'grantedAt': now,
+          'grantedBy': adminUserId.isNotEmpty ? adminUserId : null,
+        },
+        permissions: [
+          'read("user:$accountId")',
+          'update("user:$accountId")',
+          'delete("user:$accountId")',
+          'read("team:admin")',
+          'update("team:admin")',
+          'delete("team:admin")',
+        ],
+      );
+      created++;
+    } catch (e) {
+      context.log('Warning: file_access for $accountId failed: $e');
+    }
+  }
+  context.log('Created $created file_access entries');
+  return created;
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -392,6 +571,13 @@ Future<dynamic> _handleUpdate(
   }
   if (body.containsKey('videoUrl')) {
     updateData['video_url'] = body['videoUrl'] as String?;
+  }
+  if (body.containsKey('storageFileId')) {
+    final sfi = (body['storageFileId'] as String?)?.trim();
+    if (sfi != null && sfi.isNotEmpty) {
+      updateData['storage_file_id'] = sfi;
+      updateData.remove('video_url'); // prefer storage file over legacy URL
+    }
   }
   if (body.containsKey('isActive')) {
     updateData['is_active'] = body['isActive'] as bool? ?? true;
