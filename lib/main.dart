@@ -456,29 +456,29 @@ Future<int> _attachVideoFile({
 }) async {
   final now = DateTime.now().toIso8601String();
 
-  // 1. Fetch current storage file permissions and add recipients
-  final storageFile = await storage.getFile(
-    bucketId: mediaFilesBucketId,
-    fileId: storageFileId,
-  );
-  final storagePerms = List<String>.from(storageFile.$permissions);
-  for (final id in targetAccountIds) {
-    final p = 'read("user:$id")';
-    if (!storagePerms.contains(p)) storagePerms.add(p);
-  }
-  for (final p in [
+  // 1. Set Storage permissions.
+  //    The file was just uploaded from MAIA with [] (no permissions), so we
+  //    build the list from scratch – no need to fetch and merge first.
+  final storagePerms = <String>[
+    for (final id in targetAccountIds) 'read("user:$id")',
     'read("team:admin")',
     'update("team:admin")',
     'delete("team:admin")',
-  ]) {
-    if (!storagePerms.contains(p)) storagePerms.add(p);
+  ];
+  try {
+    await storage.updateFile(
+      bucketId: mediaFilesBucketId,
+      fileId: storageFileId,
+      permissions: storagePerms,
+    );
+    context.log(
+      'Storage permissions set for ${targetAccountIds.length} users',
+    );
+  } catch (e) {
+    // Log but don't abort – DB records are still useful even if storage
+    // permission update fails (e.g. SDK response-parsing quirks in v21).
+    context.log('Warning: storage.updateFile failed: $e');
   }
-  await storage.updateFile(
-    bucketId: mediaFilesBucketId,
-    fileId: storageFileId,
-    permissions: storagePerms,
-  );
-  context.log('Storage permissions set for ${targetAccountIds.length} users');
 
   // 2. Create mediaFiles DB document (read-only for all recipients, no owner)
   final dbPerms = <String>[
