@@ -123,12 +123,12 @@ Future<dynamic> main(final context) async {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// Fetch ALL user documents from the users collection (paginated).
-Future<List<appwrite.Row>> _fetchAllUsers(
+Future<List<dynamic>> _fetchAllUsers(
   appwrite.TablesDB database,
   String databaseId,
   String usersCollectionId,
 ) async {
-  final allUsers = <appwrite.Row>[];
+  final allUsers = <dynamic>[];
   int offset = 0;
   const batchSize = 100;
   bool hasMore = true;
@@ -163,8 +163,7 @@ Future<List<String>> _resolveTargetAccountIds(
 
   if (targetType == 'users') {
     // Specific user IDs provided — these are Collection-DocIDs (== Account IDs in this setup)
-    final targetUserIds =
-        (body['targetUserIds'] as List?)
+    final targetUserIds = (body['targetUserIds'] as List?)
             ?.map((e) => e.toString().trim())
             .where((e) => e.isNotEmpty)
             .toList() ??
@@ -187,8 +186,7 @@ Future<List<String>> _resolveTargetAccountIds(
   context.log('Fetched ${allUsers.length} total users');
 
   if (targetType == 'labels') {
-    final targetLabels =
-        (body['targetLabels'] as List?)
+    final targetLabels = (body['targetLabels'] as List?)
             ?.map((e) => e.toString().trim().toLowerCase())
             .where((e) => e.isNotEmpty)
             .toSet() ??
@@ -203,8 +201,7 @@ Future<List<String>> _resolveTargetAccountIds(
 
     final matchingIds = <String>[];
     for (final user in allUsers) {
-      final userLabels =
-          (user.data['labels'] as List?)
+      final userLabels = (user.data['labels'] as List?)
               ?.map((e) => e.toString().toLowerCase())
               .toSet() ??
           {};
@@ -390,8 +387,8 @@ Future<dynamic> _handleUpdate(
   }
   if (body.containsKey('priority')) {
     // Normalize to uppercase
-    updateData['priority'] = ((body['priority'] as String?)?.trim() ?? 'normal')
-        .toUpperCase();
+    updateData['priority'] =
+        ((body['priority'] as String?)?.trim() ?? 'normal').toUpperCase();
   }
   if (body.containsKey('videoUrl')) {
     updateData['video_url'] = body['videoUrl'] as String?;
