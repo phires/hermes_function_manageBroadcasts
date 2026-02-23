@@ -315,9 +315,11 @@ Future<dynamic> _handleCreate(
     'is_active': isActive,
   };
 
-  // Prefer uploaded storage file over legacy URL
+  // Prefer uploaded storage file over legacy URL.
+  // We encode the Appwrite storage file ID as "storage://<fileId>" inside
+  // the existing video_url field, which avoids any schema changes.
   if (storageFileId != null && storageFileId.isNotEmpty) {
-    docData['storage_file_id'] = storageFileId;
+    docData['video_url'] = 'storage://$storageFileId';
   } else if (videoUrl != null && videoUrl.isNotEmpty) {
     docData['video_url'] = videoUrl;
   }
@@ -575,8 +577,8 @@ Future<dynamic> _handleUpdate(
   if (body.containsKey('storageFileId')) {
     final sfi = (body['storageFileId'] as String?)?.trim();
     if (sfi != null && sfi.isNotEmpty) {
-      updateData['storage_file_id'] = sfi;
-      updateData.remove('video_url'); // prefer storage file over legacy URL
+      // Encode as storage:// URI so Flutter can distinguish from plain URLs
+      updateData['video_url'] = 'storage://$sfi';
     }
   }
   if (body.containsKey('isActive')) {
